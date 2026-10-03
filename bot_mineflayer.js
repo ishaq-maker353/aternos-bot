@@ -2,19 +2,16 @@
  * Aternos 24/7 Continuous All-Time Roaming Mineflayer Bot (Node.js Engine)
  * Target Server: alamincraft.aternos.me:26832
  *
- * HOW TO RUN:
+ * RUN:
  *   node bot_mineflayer.js
  *
- * RUN WITH CUSTOM USERNAME (Recommended to avoid conflicts):
- *   node bot_mineflayer.js Frank_PC
- *
- * NOTE FOR ATERNOS:
- * Aternos enforces a connection throttle (~10 seconds). This script includes
- * an automatic 15-second throttle delay and 2-second spawn settling to prevent
- * ECONNRESET and connection throttled kicks.
+ * RAILWAY & NETLIFY COMPATIBILITY:
+ * Built-in lightweight HTTP server on process.env.PORT
+ * Allows Railway healthchecks and direct connection from Netlify web dashboard!
  */
 
 const mineflayer = require('mineflayer');
+const http = require('http');
 
 const cliUsername = process.argv[2];
 
@@ -31,9 +28,10 @@ const CONFIG = {
   sneakPulse: true,
   armSwing: true,
   autoReconnect: true,
-  reconnectBaseSec: 15, // 15s to bypass Aternos connection throttle
+  reconnectBaseSec: 15,
   reconnectMaxSec: 45,
   keepaliveTimeoutMs: 240000,
+  httpPort: parseInt(process.env.PORT || '3000', 10),
 };
 
 let bot = null;
@@ -42,11 +40,20 @@ let reconnectAttempts = 0;
 let spawnAnchor = null;
 let currentUsername = CONFIG.username;
 let wasThrottled = false;
+let logs = [];
+
+function appendLog(category, message) {
+  const ts = new Date().toLocaleTimeString();
+  const entry = { id: Date.now() + Math.random(), timestamp: ts, category, message };
+  logs.push(entry);
+  if (logs.length > 100) logs.shift();
+  console.log(`[${category.toUpperCase()}] ${message}`);
+}
 
 function startContinuousRoamLoop() {
   if (roamTimer) clearInterval(roamTimer);
   let tick = 0;
-  console.log('[ROAM] Continuous roaming loop active.');
+  appendLog('roam', 'Continuous roaming loop active.');
   roamTimer = setInterval(() => {
     if (!bot || !bot.entity) return;
     tick += 1;
@@ -58,89 +65,91 @@ function startContinuousRoamLoop() {
     const dist = Math.hypot(dx, dz);
 
     if (dist > Math.max(2.0, CONFIG.walkRadiusBlocks)) {
-      // Smoothly look back toward spawn anchor
-      Promise.resolve(bot.look(Math.atan2(-dx, -dz) + (Math.random() * 0.4 - 0.2), 0, false)).catch(() => {});
-    } else if (CONFIG.randomHeadLook && tick % 5 === 0) {
-      // Gentle natural head motion
-      Promise.resolve(
-        bot.look(bot.entity.yaw + (Math.random() * 0.8 - 0.4), (Math.random() * 2 - 1) * 0.18, false)
-      ).catch(() => {});
+      const yawBack = Math.atan2(-dx, -dz);
+      bot.look(yawBack, 0, true).catch(() => {});
+      bot.setControlState('forward', true);
+      bot.setControlState('back', false);
+    } else {
+      if (tick % 7 === 0) {
+        const randYaw = (Math.random() * Math.PI * 2) - Math.PI;
+        bot.look(randYaw, (Math.random() - 0.5) * 0.4, true).catch(() => {});
+      }
+      bot.setControlState('forward', true);
     }
 
-    bot.setControlState('forward', Boolean(CONFIG.autoWalk));
-    bot.setControlState('jump', Boolean(CONFIG.autoJump && tick % 6 === 0));
-    if (CONFIG.armSwing && tick % 8 === 0) {
-      try { bot.swingArm('right'); } catch {}
+    if (CONFIG.autoJump && (bot.entity.isCollidedHorizontally || tick % 11 === 0)) {
+      bot.setControlState('jump', true);
+      setTimeout(() => bot && bot.setControlState('jump', false), 250);
     }
-    if (CONFIG.sneakPulse && tick % 14 === 0) {
+
+    if (CONFIG.armSwing && tick % 9 === 0) {
+      bot.swingArm('right');
+    }
+
+    if (CONFIG.sneakPulse && tick % 19 === 0) {
       bot.setControlState('sneak', true);
-      setTimeout(() => { if (bot) bot.setControlState('sneak', false); }, 250);
+      setTimeout(() => bot && bot.setControlState('sneak', false), 400);
     }
-  }, 450);
+  }, 400);
 }
 
 function createBot() {
-  console.log(`[CONNECTING] Connecting to ${CONFIG.host}:${CONFIG.port} as ${currentUsername}...`);
-  bot = mineflayer.createBot({
-    host: CONFIG.host,
-    port: CONFIG.port,
-    username: currentUsername,
-    version: CONFIG.version || undefined,
-    auth: CONFIG.auth,
-    checkTimeoutInterval: CONFIG.keepaliveTimeoutMs,
-    hideErrors: true,
-  });
+  if (roamTimer) clearInterval(roamTimer);
+  spawnAnchor = null;
 
-  if (bot._client) {
-    bot._client.on('connect', () => {
-      try {
-        if (bot._client.socket) {
-          bot._client.socket.setKeepAlive(true, 10000);
-          bot._client.socket.setNoDelay(true);
-        }
-      } catch {}
+  appendLog('system', `Connecting to ${CONFIG.host}:${CONFIG.port} as ${currentUsername}...`);
+
+  try {
+    bot = mineflayer.createBot({
+      host: CONFIG.host,
+      port: CONFIG.port,
+      username: currentUsername,
+      version: CONFIG.version || false,
+      auth: CONFIG.auth,
+      checkTimeoutInterval: CONFIG.keepaliveTimeoutMs,
+      hideErrors: false,
     });
+  } catch (err) {
+    appendLog('error', `Creation error: ${err.message}`);
+    return;
   }
 
-  bot.once('spawn', () => {
+  bot.on('login', () => {
     reconnectAttempts = 0;
     wasThrottled = false;
-    const p = bot.entity.position;
-    spawnAnchor = { x: p.x, y: p.y, z: p.z };
-    console.log(`[SPAWN] Successfully joined world at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`);
-    console.log('[SPAWN] Waiting 2 seconds for chunks to stabilize before roaming...');
-    setTimeout(() => {
-      if (bot && bot.entity) startContinuousRoamLoop();
-    }, 2000);
+    appendLog('system', `Logged in to server as ${bot.username}`);
   });
 
-  bot.on('chat', (username, message) => {
-    if (username === bot.username) return;
-    console.log(`[CHAT] <${username}> ${message}`);
+  bot.on('spawn', () => {
+    const pos = bot.entity ? bot.entity.position : { x: 0, y: 0, z: 0 };
+    appendLog('spawn', `Bot spawned at (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`);
+    setTimeout(() => {
+      if (bot && bot.entity) {
+        startContinuousRoamLoop();
+      }
+    }, 2000);
   });
 
   bot.on('kicked', (reason) => {
     const reasonStr = typeof reason === 'string' ? reason : JSON.stringify(reason);
     if (reasonStr.includes('throttled')) {
       wasThrottled = true;
-      console.warn('\n⚠️ [THROTTLED] Aternos connection throttled. Backing off 15s before reconnecting...\n');
+      appendLog('warning', 'Aternos connection throttled. Backing off 15s before reconnecting...');
     } else if (reasonStr.includes('duplicate_login')) {
-      console.warn('\n⚠️ [DUPLICATE LOGIN]');
-      console.warn(`Username "${currentUsername}" is already active on the server.`);
-      // Switch name so it connects cleanly
+      appendLog('warning', `Duplicate login: "${currentUsername}" is already active.`);
       currentUsername = `${CONFIG.username.slice(0, 10)}_${Math.floor(10 + Math.random() * 89)}`;
-      console.warn(`Auto-switching username to "${currentUsername}" for next attempt.\n`);
+      appendLog('system', `Auto-switching username to "${currentUsername}" for next attempt.`);
     } else {
-      console.log('[KICKED]', reasonStr);
+      appendLog('kicked', reasonStr);
     }
   });
 
   bot.on('error', (err) => {
     const msg = err?.message || String(err);
     if (msg.includes('ECONNRESET')) {
-      console.warn('[NETWORK] Connection reset (ECONNRESET). Reconnecting safely...');
+      appendLog('network', 'Connection reset (ECONNRESET). Reconnecting safely...');
     } else {
-      console.error('[ERROR]', msg);
+      appendLog('error', msg);
     }
   });
 
@@ -150,9 +159,70 @@ function createBot() {
     reconnectAttempts += 1;
     let delaySec = Math.min(CONFIG.reconnectMaxSec, CONFIG.reconnectBaseSec + reconnectAttempts * 2);
     if (wasThrottled) delaySec = Math.max(16, delaySec);
-    console.log(`[RECONNECT] Reconnecting in ${delaySec}s (attempt ${reconnectAttempts})...\n`);
+    appendLog('reconnect', `Reconnecting in ${delaySec}s (attempt ${reconnectAttempts})...`);
     setTimeout(createBot, delaySec * 1000);
   });
 }
 
-createBot();
+// Built-in HTTP Server for Railway healthcheck & Netlify web dashboard API
+const httpServer = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = req.url ? req.url.split('?')[0] : '/';
+
+  if (url === '/' || url === '/health' || url === '/api/bot/healthcheck') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      bot: currentUsername,
+      connected: !!(bot && bot.entity),
+      uptimeSec: Math.floor(process.uptime()),
+    }));
+    return;
+  }
+
+  if (url === '/api/bot/state') {
+    const pos = bot?.entity?.position || { x: 0, y: 0, z: 0 };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      running: true,
+      connectionState: bot?.entity ? 'Connected' : (bot ? 'Connecting' : 'Disconnected'),
+      player: {
+        username: currentUsername,
+        health: bot?.health ?? 20,
+        food: bot?.food ?? 20,
+        position: { x: pos.x, y: pos.y, z: pos.z },
+        yaw: bot?.entity?.yaw ?? 0,
+        pitch: bot?.entity?.pitch ?? 0,
+      },
+      server: {
+        host: CONFIG.host,
+        port: CONFIG.port,
+        version: CONFIG.version || 'Auto',
+      },
+      stats: {
+        totalUptimeSec: Math.floor(process.uptime()),
+        disconnectsCount: reconnectAttempts,
+        reconnectAttempts: reconnectAttempts,
+      },
+      logs: logs,
+    }));
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
+httpServer.listen(CONFIG.httpPort, '0.0.0.0', () => {
+  appendLog('system', `HTTP API Server listening on port ${CONFIG.httpPort} (Ready for Netlify & Railway)`);
+  createBot();
+});
